@@ -3,6 +3,7 @@ package ingest
 import (
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/qkd/bb84-sifter/frame"
@@ -24,9 +25,6 @@ type DoubleBuffer struct {
 	aStatus BufferStatus
 	bStatus BufferStatus
 
-	writePtr *[]frame.Event
-	readPtr  *[]frame.Event
-
 	mu       sync.RWMutex
 	writeIdx int
 	capacity int
@@ -43,8 +41,6 @@ func NewDoubleBuffer(capacity int) *DoubleBuffer {
 		aStatus:  BufferEmpty,
 		bStatus:  BufferEmpty,
 	}
-	db.writePtr = &db.bufA
-	db.readPtr = &db.bufB
 	return db
 }
 
@@ -52,8 +48,30 @@ func (db *DoubleBuffer) Write(events []frame.Event) int {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	available := db.capacity - len(*db.writePtr)
+	if len(events) == 0 {
+		return 0
+	}
+
+	var writeBuf *[]frame.Event
+	var writeStatus *BufferStatus
+
+	if db.aStatus != BufferFull {
+		writeBuf = &db.bufA
+		writeStatus = &db.aStatus
+	} else if db.bStatus != BufferFull {
+		writeBuf = &db.bufB
+		writeStatus = &db.bStatus
+	} else {
+		return 0
+	}
+
+	if *writeStatus == BufferEmpty {
+		*writeStatus = BufferFilling
+	}
+
+	available := db.capacity - len(*writeBuf)
 	if available <= 0 {
+		*writeStatus = BufferFull
 		return 0
 	}
 
@@ -62,39 +80,16 @@ func (db *DoubleBuffer) Write(events []frame.Event) int {
 		toWrite = available
 	}
 
-	*db.writePtr = append(*db.writePtr, events[:toWrite]...)
-	db.writeIdx += toWrite
+	if toWrite > 0 {
+		*writeBuf = append(*writeBuf, events[:toWrite]...)
+		db.writeIdx += toWrite
+	}
 
-	if len(*db.writePtr) >= db.capacity {
-		db.swapBuffers()
+	if len(*writeBuf) >= db.capacity {
+		*writeStatus = BufferFull
 	}
 
 	return toWrite
-}
-
-func (db *DoubleBuffer) swapBuffers() {
-	if db.writePtr == &db.bufA {
-		db.aStatus = BufferFull
-		db.writePtr = &db.bufB
-		*db.writePtr = (*db.writePtr)[:0]
-		db.bStatus = BufferFilling
-	} else {
-		db.bStatus = BufferFull
-		db.writePtr = &db.bufA
-		*db.writePtr = (*db.writePtr)[:0]
-		db.aStatus = BufferFilling
-	}
-	db.readPtr = db.fullBuffer()
-}
-
-func (db *DoubleBuffer) fullBuffer() *[]frame.Event {
-	if db.aStatus == BufferFull {
-		return &db.bufA
-	}
-	if db.bStatus == BufferFull {
-		return &db.bufB
-	}
-	return nil
 }
 
 func (db *DoubleBuffer) ReadReady() bool {
@@ -111,11 +106,11 @@ func (db *DoubleBuffer) Read() []frame.Event {
 
 	if db.aStatus == BufferFull {
 		result = db.bufA
-		db.bufA = db.bufA[:0]
+		db.bufA = make([]frame.Event, 0, db.capacity)
 		db.aStatus = BufferEmpty
 	} else if db.bStatus == BufferFull {
 		result = db.bufB
-		db.bufB = db.bufB[:0]
+		db.bufB = make([]frame.Event, 0, db.capacity)
 		db.bStatus = BufferEmpty
 	}
 
@@ -127,10 +122,18 @@ func (db *DoubleBuffer) Flush() []frame.Event {
 	defer db.mu.Unlock()
 
 	var result []frame.Event
-	if len(*db.writePtr) > 0 {
-		result = *db.writePtr
-		*db.writePtr = (*db.writePtr)[:0]
+
+	if len(db.bufA) > 0 {
+		result = db.bufA
+		db.bufA = make([]frame.Event, 0, db.capacity)
+		db.aStatus = BufferEmpty
 	}
+	if len(db.bufB) > 0 {
+		result = append(result, db.bufB...)
+		db.bufB = make([]frame.Event, 0, db.capacity)
+		db.bStatus = BufferEmpty
+	}
+
 	return result
 }
 
@@ -141,25 +144,30 @@ func (db *DoubleBuffer) Capacity() int {
 func (db *DoubleBuffer) WriteLen() int {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return len(*db.writePtr)
+	return len(db.bufA) + len(db.bufB)
 }
 
 type Ingestor struct {
-	mapper   *frame.Mapper
-	buffer   *DoubleBuffer
-	source   io.Reader
-	running  bool
-	mu       sync.Mutex
-	done     chan struct{}
-	FrameOut chan *frame.Frame
-	EventOut chan []frame.Event
+	scanner    *frame.RingScanner
+	buffer     *DoubleBuffer
+	source     io.Reader
+	running    int32
+	started    int32
+	stopOnce   sync.Once
+	startOnce  sync.Once
+	done       chan struct{}
+	doneMu     sync.Mutex
+	FrameOut   chan *frame.Frame
+	EventOut   chan []frame.Event
+	wg         sync.WaitGroup
+	scanErrs   uint64
 }
 
 func NewIngestor(src io.Reader, bufCapacity int) *Ingestor {
 	return &Ingestor{
-		mapper:   frame.NewMapper(),
-		buffer:   NewDoubleBuffer(bufCapacity),
 		source:   src,
+		scanner:  frame.NewRingScanner(src, frame.DefaultRingCap),
+		buffer:   NewDoubleBuffer(bufCapacity),
 		done:     make(chan struct{}),
 		FrameOut: make(chan *frame.Frame, 256),
 		EventOut: make(chan []frame.Event, 64),
@@ -167,88 +175,142 @@ func NewIngestor(src io.Reader, bufCapacity int) *Ingestor {
 }
 
 func (ing *Ingestor) Start() error {
-	ing.mu.Lock()
-	if ing.running {
-		ing.mu.Unlock()
+	if !atomic.CompareAndSwapInt32(&ing.started, 0, 1) {
 		return nil
 	}
-	ing.running = true
-	ing.done = make(chan struct{})
-	ing.mu.Unlock()
 
-	go ing.readLoop()
-	go ing.flushLoop()
+	ing.startOnce.Do(func() {
+		ing.doneMu.Lock()
+		ing.done = make(chan struct{})
+		ing.doneMu.Unlock()
+
+		atomic.StoreInt32(&ing.running, 1)
+
+		if err := ing.scanner.Start(); err != nil {
+			atomic.StoreInt32(&ing.started, 0)
+			atomic.StoreInt32(&ing.running, 0)
+			return
+		}
+
+		ing.wg.Add(2)
+		go ing.frameDispatchLoop()
+		go ing.flushLoop()
+	})
+
 	return nil
 }
 
 func (ing *Ingestor) Stop() {
-	ing.mu.Lock()
-	defer ing.mu.Unlock()
-	if !ing.running {
-		return
-	}
-	ing.running = false
-	close(ing.done)
+	ing.stopOnce.Do(func() {
+		atomic.StoreInt32(&ing.running, 0)
 
-	remaining := ing.buffer.Flush()
-	if len(remaining) > 0 {
-		select {
-		case ing.EventOut <- remaining:
-		default:
+		ing.doneMu.Lock()
+		if ing.done != nil {
+			select {
+			case <-ing.done:
+			default:
+				close(ing.done)
+			}
 		}
-	}
+		ing.doneMu.Unlock()
+
+		ing.scanner.Stop()
+
+		ing.wg.Wait()
+
+		remaining := ing.buffer.Flush()
+		if len(remaining) > 0 {
+			ing.trySendEvents(remaining)
+		}
+
+		close(ing.FrameOut)
+		close(ing.EventOut)
+	})
 }
 
-func (ing *Ingestor) readLoop() {
-	for {
+func (ing *Ingestor) isRunning() bool {
+	return atomic.LoadInt32(&ing.running) == 1
+}
+
+func (ing *Ingestor) frameDispatchLoop() {
+	defer ing.wg.Done()
+
+	for ing.isRunning() {
 		select {
 		case <-ing.done:
 			return
-		default:
-		}
+		case f, ok := <-ing.scanner.FrameChan():
+			if !ok {
+				return
+			}
+			if f == nil {
+				continue
+			}
 
-		f, err := ing.mapper.ReadNext(ing.source)
-		if err != nil {
-			time.Sleep(100 * time.Microsecond)
-			continue
-		}
+			ing.trySendFrame(f)
 
-		select {
-		case ing.FrameOut <- f:
-		default:
-		}
-
-		if len(f.Events) > 0 {
-			written := ing.buffer.Write(f.Events)
-			if written < len(f.Events) {
-				if ing.buffer.ReadReady() {
-					events := ing.buffer.Read()
-					if len(events) > 0 {
-						ing.EventOut <- events
-					}
-				}
-				ing.buffer.Write(f.Events[written:])
+			if f.Len() > 0 {
+				ing.processFrameEvents(f.Events)
 			}
 		}
 	}
 }
 
+func (ing *Ingestor) trySendFrame(f *frame.Frame) {
+	select {
+	case <-ing.done:
+		return
+	case ing.FrameOut <- f:
+	default:
+	}
+}
+
+func (ing *Ingestor) trySendEvents(events []frame.Event) {
+	select {
+	case <-ing.done:
+		return
+	case ing.EventOut <- events:
+	default:
+	}
+}
+
+func (ing *Ingestor) processFrameEvents(events []frame.Event) {
+	if len(events) == 0 {
+		return
+	}
+
+	written := ing.buffer.Write(events)
+	for written < len(events) && ing.isRunning() {
+		if ing.buffer.ReadReady() {
+			batch := ing.buffer.Read()
+			if len(batch) > 0 {
+				ing.trySendEvents(batch)
+			}
+		}
+		remaining := events[written:]
+		w := ing.buffer.Write(remaining)
+		if w == 0 {
+			time.Sleep(50 * time.Microsecond)
+		}
+		written += w
+	}
+}
+
 func (ing *Ingestor) flushLoop() {
+	defer ing.wg.Done()
+
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
-	for {
+	for ing.isRunning() {
 		select {
 		case <-ing.done:
 			return
 		case <-ticker.C:
 			if ing.buffer.ReadReady() {
-				events := ing.buffer.Read()
-				if len(events) > 0 {
-					select {
-					case ing.EventOut <- events:
-					default:
-					}
+				batch := ing.buffer.Read()
+				if len(batch) > 0 {
+					ing.trySendEvents(batch)
 				}
 			}
 		}
@@ -257,4 +319,8 @@ func (ing *Ingestor) flushLoop() {
 
 func (ing *Ingestor) BufferStats() (writeLen, capacity int) {
 	return ing.buffer.WriteLen(), ing.buffer.Capacity()
+}
+
+func (ing *Ingestor) ScannerStats() (readable, writable, errCount, resets int) {
+	return ing.scanner.Stats()
 }
